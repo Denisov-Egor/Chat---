@@ -6,18 +6,20 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
-#include <map>
 #include <set>
 #include <deque>
 #include <chrono>
 #include <sstream>
 #include <cctype>
+#include <cstdlib>   // для strtol
 
 // Кроссплатформенные сокеты
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
+    #ifdef _MSC_VER
+        #pragma comment(lib, "ws2_32.lib")
+    #endif
     using socklen_t = int;
     #define CLOSE_SOCKET(s) closesocket(s)
     #define SOCKET_ERRNO WSAGetLastError()
@@ -43,7 +45,7 @@ std::string nick_color(const std::string& nick) {
         "\033[95m", "\033[96m", "\033[31m", "\033[32m",
         "\033[33m", "\033[34m", "\033[35m", "\033[36m"
     };
-    int idx = std::tolower(nick[0]) % 12;
+    int idx = std::tolower(static_cast<unsigned char>(nick[0])) % 12;
     return colors[idx];
 }
 
@@ -74,6 +76,19 @@ int max_clients_limit = 5;
 std::atomic<bool> server_running{false};
 socket_t listen_sock_global = INVALID_SOCK;
 std::thread accept_thread;
+
+// Безопасное преобразование строки в целое число
+int safe_stoi(const std::string& str, bool& ok) {
+    ok = false;
+    if (str.empty()) return 0;
+    char* end = nullptr;
+    long val = std::strtol(str.c_str(), &end, 10);
+    if (end != str.c_str() && *end == '\0' && val >= 0) {
+        ok = true;
+        return static_cast<int>(val);
+    }
+    return 0;
+}
 
 // Вспомогательные функции
 bool init_sockets() {
@@ -224,7 +239,6 @@ void process_command(const std::string& line, socket_t sock) {
         bool nick_exists = false;
         {
             std::lock_guard<std::mutex> lock(clients_mtx);
-            // Проверяем, существует ли клиент
             ClientInfo* client = nullptr;
             for (auto& c : clients) {
                 if (c.socket == sock) {
@@ -232,9 +246,8 @@ void process_command(const std::string& line, socket_t sock) {
                     break;
                 }
             }
-            if (!client) return; // клиент удалён
+            if (!client) return;
 
-            // Проверяем занятость нового ника
             for (auto& c : clients) {
                 if (c.nickname == new_nick) {
                     nick_exists = true;
@@ -329,7 +342,6 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
     while (true) {
         int bytes = recv(sock, data_chunk, sizeof(data_chunk) - 1, 0);
         if (bytes <= 0) {
-            // Соединение разорвано – пытаемся удалить клиента, если он ещё в списке
             std::string my_nick;
             {
                 std::lock_guard<std::mutex> lock(clients_mtx);
@@ -340,7 +352,7 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
                     }
                 }
             }
-            remove_client(sock, my_nick); // если ник пуст – не будет сообщения
+            remove_client(sock, my_nick);
             return;
         }
         data_chunk[bytes] = '\0';
@@ -354,7 +366,6 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
 
             if (line.empty()) continue;
 
-            // Получаем актуальные данные клиента под блокировкой
             std::string nick;
             bool muted = false;
             bool exists = false;
@@ -371,7 +382,6 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
             }
 
             if (!exists) {
-                // Клиент был удалён администратором – просто выходим
                 return;
             }
 
@@ -419,7 +429,7 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
     }
 }
 
-// Обработка команд администратора сервера (без изменений, уже безопасна)
+// Обработка команд администратора сервера
 void process_admin_command(const std::string& line) {
     std::istringstream iss(line);
     std::string cmd;
@@ -574,9 +584,21 @@ void process_admin_command(const std::string& line) {
     else if (cmd == "/quit") {
         std::cout << "Остановка сервера...\n";
         server_running = false;
+
+        // Закрываем слушающий сокет, чтобы accept завершился
         if (listen_sock_global != INVALID_SOCK) {
             CLOSE_SOCKET(listen_sock_global);
             listen_sock_global = INVALID_SOCK;
+        }
+
+        // Закрываем все клиентские сокеты и очищаем список
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            for (auto& c : clients) {
+                send_line(c.socket, SYS_COL + "Сервер остановлен. До свидания!" + RESET);
+                CLOSE_SOCKET(c.socket);
+            }
+            clients.clear();
         }
     }
     else {
@@ -633,13 +655,14 @@ void accept_loop(int port) {
         std::thread(handle_client, client_sock, client_addr).detach();
     }
 
+    // Дополнительная подстраховка (на случай, если сокет ещё не закрыт)
     if (listen_sock_global != INVALID_SOCK) {
         CLOSE_SOCKET(listen_sock_global);
         listen_sock_global = INVALID_SOCK;
     }
 }
 
-// Клиент (без изменений)
+// Клиент
 void run_client(const std::string& ip, int port) {
     std::string nick;
     std::cout << "Введите ваш ник: ";
@@ -753,16 +776,32 @@ int main(int argc, char* argv[]) {
     int port = 12345;
     int max_clients = 5;
 
+    // Безопасное чтение порта и лимита
     if (mode == "server") {
-        if (argc >= 3) port = std::stoi(argv[2]);
-        if (argc >= 4) max_clients = std::stoi(argv[3]);
-        if (max_clients < 0) max_clients = 0;
+        if (argc >= 3) {
+            bool ok;
+            port = safe_stoi(argv[2], ok);
+            if (!ok) {
+                std::cerr << "Некорректный номер порта" << std::endl;
+                cleanup_sockets();
+                return 1;
+            }
+        }
+        if (argc >= 4) {
+            bool ok;
+            max_clients = safe_stoi(argv[3], ok);
+            if (!ok) {
+                std::cerr << "Некорректное значение лимита клиентов" << std::endl;
+                cleanup_sockets();
+                return 1;
+            }
+            if (max_clients < 0) max_clients = 0;
+        }
         max_clients_limit = max_clients;
 
         server_running = true;
         accept_thread = std::thread(accept_loop, port);
 
-        // Главный поток — консоль администратора
         std::string admin_input;
         while (server_running) {
             if (!std::getline(std::cin, admin_input)) {
@@ -784,7 +823,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::string ip = argv[2];
-        if (argc >= 4) port = std::stoi(argv[3]);
+        if (argc >= 4) {
+            bool ok;
+            port = safe_stoi(argv[3], ok);
+            if (!ok) {
+                std::cerr << "Некорректный номер порта" << std::endl;
+                cleanup_sockets();
+                return 1;
+            }
+        }
         run_client(ip, port);
     } else {
         std::cerr << "Неизвестный режим. Используйте 'server' или 'client'." << std::endl;
