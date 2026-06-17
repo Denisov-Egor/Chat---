@@ -1,0 +1,664 @@
+#include <iostream>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <set>
+#include <deque>
+#include <chrono>
+#include <sstream>
+#include <cctype>
+
+// Кроссплатформенные сокеты
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    using socklen_t = int;
+    #define CLOSE_SOCKET(s) closesocket(s)
+    #define SOCKET_ERRNO WSAGetLastError()
+    using socket_t = SOCKET;
+    const socket_t INVALID_SOCK = INVALID_SOCKET;
+#else
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <netinet/in.h>
+    #include <cerrno>
+    #define CLOSE_SOCKET(s) close(s)
+    #define SOCKET_ERRNO errno
+    using socket_t = int;
+    const socket_t INVALID_SOCK = -1;
+#endif
+
+// Цвета для вывода
+std::string nick_color(const std::string& nick) {
+    if (nick.empty()) return "\033[0m";
+    const char* colors[] = {
+        "\033[91m", "\033[92m", "\033[93m", "\033[94m",
+        "\033[95m", "\033[96m", "\033[31m", "\033[32m",
+        "\033[33m", "\033[34m", "\033[35m", "\033[36m"
+    };
+    int idx = std::tolower(nick[0]) % 12;
+    return colors[idx];
+}
+
+const std::string RESET   = "\033[0m";
+const std::string SYS_COL = "\033[90m";
+const std::string ERR_COL = "\033[91m";
+
+// Глобальные данные сервера
+std::mutex clients_mtx;
+std::mutex banned_mtx;
+
+struct ClientInfo {
+    socket_t socket;
+    std::string nickname;
+    std::string ip;
+    bool muted = false;
+    std::deque<std::chrono::steady_clock::time_point> msg_times;
+
+    // Конструктор для удобного добавления
+    ClientInfo(socket_t s, const std::string& n, const std::string& i)
+        : socket(s), nickname(n), ip(i) {}
+};
+
+std::vector<ClientInfo> clients;
+std::set<std::string> banned_ips;
+std::string admin_nick;
+int max_clients_limit = 5;
+
+// Вспомогательные функции
+bool init_sockets() {
+#ifdef _WIN32
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+#else
+    return true;
+#endif
+}
+
+void cleanup_sockets() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+bool send_all(socket_t sock, const std::string& data) {
+    int total = data.size();
+    int sent = 0;
+    while (sent < total) {
+        int res = send(sock, data.c_str() + sent, total - sent, 0);
+        if (res <= 0) return false;
+        sent += res;
+    }
+    return true;
+}
+
+bool send_line(socket_t sock, const std::string& line) {
+    return send_all(sock, line + "\n");
+}
+
+std::string get_ip(const sockaddr_in& addr) {
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(addr.sin_addr), ip_str, INET_ADDRSTRLEN);
+    return std::string(ip_str);
+}
+
+void broadcast(const std::string& message, socket_t exclude = INVALID_SOCK,
+               const std::string& prefix = "", const std::string& color = "") {
+    std::lock_guard<std::mutex> lock(clients_mtx);
+    for (auto& c : clients) {
+        if (c.socket != exclude) {
+            std::string full = color + prefix + message + RESET;
+            send_line(c.socket, full);
+        }
+    }
+}
+
+void remove_client(socket_t sock, const std::string& nickname) {
+    {
+        std::lock_guard<std::mutex> lock(clients_mtx);
+        clients.erase(
+            std::remove_if(clients.begin(), clients.end(),
+                           [sock](const ClientInfo& c) { return c.socket == sock; }),
+            clients.end());
+        if (nickname == admin_nick) admin_nick.clear();
+    }
+    CLOSE_SOCKET(sock);
+    if (!nickname.empty()) {
+        broadcast(nickname + " покинул чат.", INVALID_SOCK, "Система: ", SYS_COL);
+    }
+}
+
+// Обработка команд
+void process_command(const std::string& line, ClientInfo& client) {
+    std::istringstream iss(line);
+    std::string cmd;
+    iss >> cmd;
+
+    if (cmd == "/help") {
+        std::string help =
+            "Доступные команды:\n"
+            "  /help          - эта справка\n"
+            "  /list          - список участников\n"
+            "  /whisper <ник> <текст> - личное сообщение\n"
+            "  /nick <новый>  - сменить ник\n"
+            "  /quit          - выйти из чата\n";
+        if (client.nickname == admin_nick) {
+            help +=
+                "  /kick <ник>    - выгнать участника\n"
+                "  /ban <ник>     - забанить по IP\n"
+                "  /mute <ник>    - запретить отправку сообщений\n"
+                "  /unmute <ник>  - разрешить отправку\n";
+        }
+        send_line(client.socket, SYS_COL + help + RESET);
+    }
+    else if (cmd == "/list") {
+        std::lock_guard<std::mutex> lock(clients_mtx);
+        std::string list = "Участники (" + std::to_string(clients.size()) + "):\n";
+        for (auto& c : clients) {
+            list += "  " + nick_color(c.nickname) + c.nickname + RESET;
+            if (c.muted) list += " [muted]";
+            if (c.nickname == admin_nick) list += " (admin)";
+            list += "\n";
+        }
+        send_line(client.socket, list);
+    }
+    else if (cmd == "/whisper") {
+        std::string target, text;
+        if (!(iss >> target)) {
+            send_line(client.socket, ERR_COL + "Использование: /whisper <ник> <текст>" + RESET);
+            return;
+        }
+        std::getline(iss, text);
+        if (!text.empty() && text[0] == ' ') text.erase(0, 1);
+        if (text.empty()) {
+            send_line(client.socket, ERR_COL + "Сообщение не может быть пустым" + RESET);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(clients_mtx);
+        bool found = false;
+        for (auto& c : clients) {
+            if (c.nickname == target) {
+                send_line(c.socket, nick_color(client.nickname) + "[ЛС от " + client.nickname + "] " + RESET + text);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            send_line(client.socket, ERR_COL + "Пользователь '" + target + "' не найден" + RESET);
+        }
+    }
+    else if (cmd == "/nick") {
+        std::string new_nick;
+        if (!(iss >> new_nick)) {
+            send_line(client.socket, ERR_COL + "Использование: /nick <новый ник>" + RESET);
+            return;
+        }
+        if (new_nick.empty() || new_nick.find_first_of(" /\r\n") != std::string::npos) {
+            send_line(client.socket, ERR_COL + "Ник не должен содержать пробелы или запрещённые символы" + RESET);
+            return;
+        }
+        if (new_nick == "Система") {
+            send_line(client.socket, ERR_COL + "Запрещённый ник" + RESET);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            bool exists = false;
+            for (auto& c : clients) {
+                if (c.nickname == new_nick) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (exists) {
+                send_line(client.socket, ERR_COL + "Ник '" + new_nick + "' уже занят" + RESET);
+                return;
+            }
+            std::string old_nick = client.nickname;
+            client.nickname = new_nick;
+            if (old_nick == admin_nick) {
+                admin_nick = new_nick;
+            }
+            broadcast(old_nick + " теперь известен как " + new_nick, INVALID_SOCK, "Система: ", SYS_COL);
+        }
+    }
+    else if (cmd == "/kick" && client.nickname == admin_nick) {
+        std::string target;
+        if (!(iss >> target)) {
+            send_line(client.socket, ERR_COL + "Использование: /kick <ник>" + RESET);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(clients_mtx);
+        for (auto it = clients.begin(); it != clients.end(); ++it) {
+            if (it->nickname == target && it->socket != client.socket) {
+                send_line(it->socket, SYS_COL + "Вас исключили из чата" + RESET);
+                CLOSE_SOCKET(it->socket);
+                if (it->nickname == admin_nick) admin_nick.clear();
+                clients.erase(it);
+                broadcast(target + " исключён администратором.", INVALID_SOCK, "Система: ", SYS_COL);
+                return;
+            }
+        }
+        send_line(client.socket, ERR_COL + "Пользователь не найден" + RESET);
+    }
+    else if (cmd == "/ban" && client.nickname == admin_nick) {
+        std::string target;
+        if (!(iss >> target)) {
+            send_line(client.socket, ERR_COL + "Использование: /ban <ник>" + RESET);
+            return;
+        }
+        std::string ip_to_ban;
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            for (auto it = clients.begin(); it != clients.end(); ++it) {
+                if (it->nickname == target && it->socket != client.socket) {
+                    ip_to_ban = it->ip;
+                    send_line(it->socket, SYS_COL + "Вы забанены" + RESET);
+                    CLOSE_SOCKET(it->socket);
+                    if (it->nickname == admin_nick) admin_nick.clear();
+                    clients.erase(it);
+                    break;
+                }
+            }
+        }
+        if (!ip_to_ban.empty()) {
+            std::lock_guard<std::mutex> lock(banned_mtx);
+            banned_ips.insert(ip_to_ban);
+            broadcast(target + " забанен администратором.", INVALID_SOCK, "Система: ", SYS_COL);
+        } else {
+            send_line(client.socket, ERR_COL + "Пользователь не найден" + RESET);
+        }
+    }
+    else if (cmd == "/mute" && client.nickname == admin_nick) {
+        std::string target;
+        if (!(iss >> target)) {
+            send_line(client.socket, ERR_COL + "Использование: /mute <ник>" + RESET);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(clients_mtx);
+        for (auto& c : clients) {
+            if (c.nickname == target) {
+                c.muted = true;
+                send_line(c.socket, SYS_COL + "Вам запретили отправлять сообщения" + RESET);
+                broadcast(target + " заглушен администратором.", INVALID_SOCK, "Система: ", SYS_COL);
+                return;
+            }
+        }
+        send_line(client.socket, ERR_COL + "Пользователь не найден" + RESET);
+    }
+    else if (cmd == "/unmute" && client.nickname == admin_nick) {
+        std::string target;
+        if (!(iss >> target)) {
+            send_line(client.socket, ERR_COL + "Использование: /unmute <ник>" + RESET);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(clients_mtx);
+        for (auto& c : clients) {
+            if (c.nickname == target) {
+                c.muted = false;
+                send_line(c.socket, SYS_COL + "Вам снова разрешили отправлять сообщения" + RESET);
+                broadcast(target + " может снова говорить.", INVALID_SOCK, "Система: ", SYS_COL);
+                return;
+            }
+        }
+        send_line(client.socket, ERR_COL + "Пользователь не найден" + RESET);
+    }
+    else {
+        send_line(client.socket, ERR_COL + "Неизвестная команда. Введите /help для списка" + RESET);
+    }
+}
+
+// Поток для одного клиента
+void handle_client(socket_t sock, sockaddr_in client_addr) {
+    std::string ip = get_ip(client_addr);
+
+    {
+        std::lock_guard<std::mutex> lock(banned_mtx);
+        if (banned_ips.find(ip) != banned_ips.end()) {
+            send_line(sock, ERR_COL + "Вы забанены в этом чате." + RESET);
+            CLOSE_SOCKET(sock);
+            return;
+        }
+    }
+
+    // Получение ника
+    std::string buffer;
+    char chunk[256];
+    while (true) {
+        int bytes = recv(sock, chunk, sizeof(chunk) - 1, 0);
+        if (bytes <= 0) {
+            CLOSE_SOCKET(sock);
+            return;
+        }
+        chunk[bytes] = '\0';
+        buffer += chunk;
+        size_t pos = buffer.find('\n');
+        if (pos != std::string::npos) {
+            std::string nick = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            nick.erase(std::remove(nick.begin(), nick.end(), '\r'), nick.end());
+            nick.erase(std::remove(nick.begin(), nick.end(), ' '), nick.end());
+            if (nick.empty() || nick == "Система" || nick.find_first_of("/\r\n") != std::string::npos) {
+                send_line(sock, ERR_COL + "Недопустимый ник." + RESET);
+                CLOSE_SOCKET(sock);
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(clients_mtx);
+                bool exists = false;
+                for (auto& c : clients) {
+                    if (c.nickname == nick) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (exists) {
+                    send_line(sock, ERR_COL + "Ник '" + nick + "' уже занят." + RESET);
+                    CLOSE_SOCKET(sock);
+                    return;
+                }
+                if (max_clients_limit > 0 && clients.size() >= (size_t)max_clients_limit) {
+                    send_line(sock, ERR_COL + "Чат заполнен (максимум " + std::to_string(max_clients_limit) + ")." + RESET);
+                    CLOSE_SOCKET(sock);
+                    return;
+                }
+                clients.push_back(ClientInfo(sock, nick, ip));  // теперь работает благодаря конструктору
+                if (clients.size() == 1) {
+                    admin_nick = nick;
+                }
+            }
+
+            send_line(sock, SYS_COL + "Добро пожаловать, " + nick + "! Введите /help для справки." + RESET);
+            broadcast(nick + " присоединился к чату.", sock, "Система: ", SYS_COL);
+            break;
+        }
+    }
+
+    // Приём сообщений
+    std::string msg_buffer;
+    char data_chunk[1024];
+    while (true) {
+        int bytes = recv(sock, data_chunk, sizeof(data_chunk) - 1, 0);
+        if (bytes <= 0) {
+            std::string my_nick;
+            {
+                std::lock_guard<std::mutex> lock(clients_mtx);
+                for (auto& c : clients) {
+                    if (c.socket == sock) {
+                        my_nick = c.nickname;
+                        break;
+                    }
+                }
+            }
+            remove_client(sock, my_nick);
+            return;
+        }
+        data_chunk[bytes] = '\0';
+        msg_buffer += data_chunk;
+
+        size_t pos;
+        while ((pos = msg_buffer.find('\n')) != std::string::npos) {
+            std::string line = msg_buffer.substr(0, pos);
+            msg_buffer.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            if (line.empty()) continue;
+
+            std::string nick;
+            bool muted = false;
+            {
+                std::lock_guard<std::mutex> lock(clients_mtx);
+                for (auto& c : clients) {
+                    if (c.socket == sock) {
+                        nick = c.nickname;
+                        muted = c.muted;
+                        break;
+                    }
+                }
+            }
+
+            if (line == "/quit") {
+                broadcast(nick + " покинул чат.", INVALID_SOCK, "Система: ", SYS_COL);
+                remove_client(sock, nick);
+                return;
+            }
+
+            if (line[0] == '/') {
+                ClientInfo* client_ptr = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(clients_mtx);
+                    for (auto& c : clients) {
+                        if (c.socket == sock) {
+                            client_ptr = &c;
+                            break;
+                        }
+                    }
+                }
+                if (client_ptr) process_command(line, *client_ptr);
+                continue;
+            }
+
+            if (muted) {
+                send_line(sock, ERR_COL + "Вы заглушены и не можете отправлять сообщения." + RESET);
+                continue;
+            }
+
+            // Защита от флуда
+            bool drop = false;
+            {
+                std::lock_guard<std::mutex> lock(clients_mtx);
+                for (auto& c : clients) {
+                    if (c.socket == sock) {
+                        auto now = std::chrono::steady_clock::now();
+                        c.msg_times.push_back(now);
+                        while (!c.msg_times.empty() &&
+                               std::chrono::duration_cast<std::chrono::seconds>(now - c.msg_times.front()).count() >= 2) {
+                            c.msg_times.pop_front();
+                        }
+                        if (c.msg_times.size() >= 4) {
+                            send_line(sock, ERR_COL + "Слишком часто! Подождите немного." + RESET);
+                            drop = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (drop) continue;
+
+            std::string color = nick_color(nick);
+            broadcast(nick + ": " + line, INVALID_SOCK, "", color);
+        }
+    }
+}
+
+// Сервер
+void run_server(int port, int max_clients) {
+    max_clients_limit = max_clients;
+
+    socket_t listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock == INVALID_SOCK) {
+        std::cerr << "Не удалось создать сокет" << std::endl;
+        return;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listen_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "Ошибка bind" << std::endl;
+        CLOSE_SOCKET(listen_sock);
+        return;
+    }
+
+    if (listen(listen_sock, SOMAXCONN) < 0) {
+        std::cerr << "Ошибка listen" << std::endl;
+        CLOSE_SOCKET(listen_sock);
+        return;
+    }
+
+    std::cout << "Сервер запущен на порту " << port;
+    if (max_clients_limit > 0)
+        std::cout << ", максимум клиентов: " << max_clients_limit;
+    else
+        std::cout << ", без ограничений";
+    std::cout << std::endl;
+
+    while (true) {
+        sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        socket_t client_sock = accept(listen_sock, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+        if (client_sock == INVALID_SOCK) {
+            std::cerr << "Ошибка accept" << std::endl;
+            break;
+        }
+        std::thread(handle_client, client_sock, client_addr).detach();
+    }
+
+    CLOSE_SOCKET(listen_sock);
+}
+
+// Клиент
+void run_client(const std::string& ip, int port) {
+    std::string nick;
+    std::cout << "Введите ваш ник: ";
+    std::getline(std::cin, nick);
+    while (nick.empty() || nick.find_first_of(" /\r\n") != std::string::npos || nick == "Система") {
+        std::cout << "Ник не может быть пустым, содержать пробелы или '/'. Введите ещё раз: ";
+        std::getline(std::cin, nick);
+    }
+
+    socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCK) {
+        std::cerr << "Не удалось создать сокет" << std::endl;
+        return;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    std::cout << "Подключение к " << ip << ":" << port << "..." << std::endl;
+    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::cerr << "Не удалось подключиться к серверу" << std::endl;
+        CLOSE_SOCKET(sock);
+        return;
+    }
+
+    if (!send_all(sock, nick + "\n")) {
+        std::cerr << "Ошибка отправки ника" << std::endl;
+        CLOSE_SOCKET(sock);
+        return;
+    }
+
+    std::cout << "Подключено как '" << nick << "'. Введите /quit для выхода, /help для справки." << std::endl;
+
+    std::atomic<bool> connected{true};
+    std::mutex cout_mtx;
+
+    std::thread recv_thr([&]() {
+        std::string buf;
+        char tmp[1024];
+        while (connected) {
+            int bytes = recv(sock, tmp, sizeof(tmp) - 1, 0);
+            if (bytes <= 0) {
+                {
+                    std::lock_guard<std::mutex> lock(cout_mtx);
+                    if (bytes == 0)
+                        std::cout << SYS_COL << "[Соединение закрыто сервером]" << RESET << std::endl;
+                    else
+                        std::cout << ERR_COL << "[Ошибка приёма]" << RESET << std::endl;
+                }
+                connected = false;
+                break;
+            }
+            tmp[bytes] = '\0';
+            buf += tmp;
+            size_t pos;
+            while ((pos = buf.find('\n')) != std::string::npos) {
+                std::string msg = buf.substr(0, pos);
+                buf.erase(0, pos + 1);
+                if (!msg.empty() && msg.back() == '\r') msg.pop_back();
+                {
+                    std::lock_guard<std::mutex> lock(cout_mtx);
+                    std::cout << msg << RESET << std::endl;
+                }
+            }
+        }
+    });
+
+    std::thread send_thr([&]() {
+        std::string input;
+        while (connected) {
+            if (!std::getline(std::cin, input)) break;
+            if (input.empty()) continue;
+            input += '\n';
+            if (!send_all(sock, input)) {
+                {
+                    std::lock_guard<std::mutex> lock(cout_mtx);
+                    std::cout << ERR_COL << "[Ошибка отправки]" << RESET << std::endl;
+                }
+                connected = false;
+                break;
+            }
+            if (input == "/quit\n") break;
+        }
+        connected = false;
+    });
+
+    send_thr.join();
+    CLOSE_SOCKET(sock);
+    recv_thr.join();
+    std::cout << "Чат завершён." << std::endl;
+}
+
+// main
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Использование:\n"
+                  << "  Сервер: " << argv[0] << " server [порт] [макс_клиентов(0=безлимит)]\n"
+                  << "  Клиент: " << argv[0] << " client <IP-адрес> [порт]\n"
+                  << "По умолчанию: порт 12345, максимум клиентов 5" << std::endl;
+        return 1;
+    }
+
+    if (!init_sockets()) {
+        std::cerr << "Не удалось инициализировать сокеты" << std::endl;
+        return 1;
+    }
+
+    std::string mode = argv[1];
+    int port = 12345;
+    int max_clients = 5;
+
+    if (mode == "server") {
+        if (argc >= 3) port = std::stoi(argv[2]);
+        if (argc >= 4) max_clients = std::stoi(argv[3]);
+        if (max_clients < 0) max_clients = 0;
+        run_server(port, max_clients);
+    } else if (mode == "client") {
+        if (argc < 3) {
+            std::cerr << "Укажите IP-адрес сервера" << std::endl;
+            cleanup_sockets();
+            return 1;
+        }
+        std::string ip = argv[2];
+        if (argc >= 4) port = std::stoi(argv[3]);
+        run_client(ip, port);
+    } else {
+        std::cerr << "Неизвестный режим. Используйте 'server' или 'client'." << std::endl;
+    }
+
+    cleanup_sockets();
+    return 0;
+}
