@@ -39,6 +39,15 @@
     const socket_t INVALID_SOCK = -1;
 #endif
 
+// Поддержка тестов: подменяем сетевые вызовы заглушками
+#ifdef TESTING
+    #undef CLOSE_SOCKET
+    #define CLOSE_SOCKET(s) ((void)(s))
+    inline bool send_all(socket_t, const std::string&) { return true; }
+    inline bool send_line(socket_t sock, const std::string& line) { return true; }
+    inline std::string get_ip(const sockaddr_in&) { return "127.0.0.1"; }
+#endif
+
 // Цвета
 std::string nick_color(const std::string& nick) {
     if (nick.empty()) return "\033[0m";
@@ -60,7 +69,7 @@ std::mutex clients_mtx;
 std::mutex banned_mtx;
 std::mutex rooms_mtx;
 
-const size_t MAX_NICK_LENGTH = 32;  // максимальная длина ника
+const size_t MAX_NICK_LENGTH = 32;
 
 struct ClientInfo {
     socket_t socket;
@@ -89,7 +98,7 @@ std::mutex admin_cout_mtx;
 std::ofstream log_file;
 bool logging_to_file = false;
 
-// Потокобезопасная функция логирования
+// Потокобезопасное логирование
 void log_event(const std::string& msg) {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -143,6 +152,7 @@ void cleanup_sockets() {
     }
 }
 
+#ifndef TESTING
 bool send_all(socket_t sock, const std::string& data) {
     int total = data.size();
     int sent = 0;
@@ -163,6 +173,7 @@ std::string get_ip(const sockaddr_in& addr) {
     inet_ntop(AF_INET, &(addr.sin_addr), ip_str, INET_ADDRSTRLEN);
     return std::string(ip_str);
 }
+#endif
 
 void broadcast_global(const std::string& message, socket_t exclude = INVALID_SOCK) {
     std::lock_guard<std::mutex> lock(clients_mtx);
@@ -1118,6 +1129,7 @@ void run_client(const std::string& ip, int port) {
     std::cout << "Чат завершён." << std::endl;
 }
 
+#ifndef TESTING   // <-- исключаем main при сборке тестов
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Использование:\n"
@@ -1207,3 +1219,4 @@ int main(int argc, char* argv[]) {
     cleanup_sockets();
     return 0;
 }
+#endif

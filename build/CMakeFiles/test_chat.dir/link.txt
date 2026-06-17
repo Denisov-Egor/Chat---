@@ -1,0 +1,1 @@
+/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/test_chat.dir/link.d CMakeFiles/test_chat.dir/test_chat.cpp.o -o test_chat  lib/libgtest_main.a -lpthread lib/libgtest.a
