@@ -65,7 +65,7 @@ struct ClientInfo {
     std::string ip;
     bool muted = false;
     std::deque<std::chrono::steady_clock::time_point> msg_times;
-    std::string current_room;   // пустая строка = глобальный чат
+    std::string current_room;   // пустая строка = общий чат
 
     ClientInfo(socket_t s, const std::string& n, const std::string& i)
         : socket(s), nickname(n), ip(i) {}
@@ -81,7 +81,7 @@ std::atomic<bool> server_running{false};
 socket_t listen_sock_global = INVALID_SOCK;
 std::thread accept_thread;
 
-// Безопасное преобразование строки в целое число
+// Безопасное преобразование строки в целое
 int safe_stoi(const std::string& str, bool& ok) {
     ok = false;
     if (str.empty()) return 0;
@@ -131,7 +131,7 @@ std::string get_ip(const sockaddr_in& addr) {
     return std::string(ip_str);
 }
 
-// Рассылка сообщения всем (глобально, используется для системных уведомлений)
+// Рассылка всем (глобально)
 void broadcast_global(const std::string& message, socket_t exclude = INVALID_SOCK) {
     std::lock_guard<std::mutex> lock(clients_mtx);
     for (auto& c : clients) {
@@ -141,7 +141,7 @@ void broadcast_global(const std::string& message, socket_t exclude = INVALID_SOC
     }
 }
 
-// Рассылка сообщения только участникам определённой комнаты
+// Рассылка только участникам комнаты
 void broadcast_to_room(const std::string& room, const std::string& message, socket_t exclude = INVALID_SOCK) {
     std::lock_guard<std::mutex> lock(rooms_mtx);
     auto it = rooms.find(room);
@@ -153,7 +153,7 @@ void broadcast_to_room(const std::string& room, const std::string& message, sock
     }
 }
 
-// Удаление клиента из списка (с учётом выхода из комнаты)
+// Удаление клиента (вызывается при выходе или разрыве соединения)
 void remove_client(socket_t sock, const std::string& nickname) {
     std::string room;
     bool existed = false;
@@ -168,9 +168,8 @@ void remove_client(socket_t sock, const std::string& nickname) {
         }
     }
 
-    // Удаляем из комнаты (если был)
+    // Удаляем из комнаты, если был
     if (!room.empty()) {
-        bool room_empty = false;
         {
             std::lock_guard<std::mutex> lock(rooms_mtx);
             auto rit = rooms.find(room);
@@ -178,7 +177,6 @@ void remove_client(socket_t sock, const std::string& nickname) {
                 rit->second.erase(sock);
                 if (rit->second.empty()) {
                     rooms.erase(rit);
-                    room_empty = true;
                 }
             }
         }
@@ -193,7 +191,7 @@ void remove_client(socket_t sock, const std::string& nickname) {
     }
 }
 
-// Выход клиента из текущей комнаты (без закрытия сокета)
+// Выход из текущей комнаты без закрытия сокета
 void leave_current_room(socket_t sock, const std::string& nick, const std::string& room) {
     if (room.empty()) return;
     {
@@ -209,7 +207,7 @@ void leave_current_room(socket_t sock, const std::string& nick, const std::strin
     broadcast_to_room(room, SYS_COL + "Система: " + nick + " покинул комнату " + room + RESET);
 }
 
-// Обработка команд от клиентов
+// Обработка команд клиентов
 void process_command(const std::string& line, socket_t sock) {
     std::istringstream iss(line);
     std::string cmd;
@@ -226,7 +224,7 @@ void process_command(const std::string& line, socket_t sock) {
             }
         }
     }
-    if (my_nick.empty()) return;
+    if (my_nick.empty()) return; // клиент уже удалён
 
     if (cmd == "/help") {
         std::string help =
@@ -235,6 +233,7 @@ void process_command(const std::string& line, socket_t sock) {
             "  /list          - список участников\n"
             "  /rooms         - список комнат\n"
             "  /join #комната - войти в комнату\n"
+            "  /create #комната - создать комнату и войти (аналогично /join)\n"
             "  /leave         - выйти из комнаты (вернуться в общий чат)\n"
             "  /whisper <ник> <текст> - личное сообщение\n"
             "  /nick <новый>  - сменить ник\n"
@@ -260,10 +259,10 @@ void process_command(const std::string& line, socket_t sock) {
         }
         send_line(sock, SYS_COL + list + RESET);
     }
-    else if (cmd == "/join") {
+    else if (cmd == "/join" || cmd == "/create") {
         std::string room;
         if (!(iss >> room)) {
-            send_line(sock, ERR_COL + "Использование: /join #комната" + RESET);
+            send_line(sock, ERR_COL + "Использование: " + cmd + " #комната" + RESET);
             return;
         }
         if (room.empty() || room[0] != '#') {
@@ -273,14 +272,13 @@ void process_command(const std::string& line, socket_t sock) {
 
         // Сначала покидаем текущую комнату, если есть
         {
-            std::lock_guard<std::mutex> lock(clients_mtx);
+            std::unique_lock<std::mutex> lock(clients_mtx);
             for (auto& c : clients) {
                 if (c.socket == sock) {
                     if (!c.current_room.empty() && c.current_room != room) {
                         std::string old_room = c.current_room;
                         c.current_room.clear();
-                        // Разблокируем clients_mtx перед вызовом leave_current_room
-                        lock.~lock_guard(); // временно выходим
+                        lock.unlock(); // отпускаем мьютекс перед вызовом leave_current_room
                         leave_current_room(sock, my_nick, old_room);
                         break;
                     }
@@ -396,7 +394,6 @@ void process_command(const std::string& line, socket_t sock) {
             return;
         }
 
-        // Уведомление о смене ника – глобальное, но также нужно в комнате, если в ней
         broadcast_global(SYS_COL + "Система: " + old_nick + " теперь известен как " + new_nick + RESET);
         if (!my_room.empty()) {
             broadcast_to_room(my_room, SYS_COL + "Система: " + old_nick + " теперь известен как " + new_nick + RESET);
@@ -407,7 +404,7 @@ void process_command(const std::string& line, socket_t sock) {
     }
 }
 
-// Поток для одного клиента
+// Поток обслуживания одного клиента
 void handle_client(socket_t sock, sockaddr_in client_addr) {
     std::string ip = get_ip(client_addr);
 
@@ -562,7 +559,7 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
             std::string color = nick_color(nick);
             std::string full_msg = color + nick + ": " + line + RESET;
             if (room.empty()) {
-                // Глобальный чат: всем, у кого пустая комната
+                // Глобальный чат: только тем, у кого пустая комната
                 std::lock_guard<std::mutex> lock(clients_mtx);
                 for (auto& c : clients) {
                     if (c.current_room.empty() && c.socket != sock) {
@@ -624,7 +621,6 @@ void process_admin_command(const std::string& line) {
             return;
         }
         std::cout << "Участники комнаты " << room << ":\n";
-        // Для получения ников нужен clients_mtx, захватываем его
         std::lock_guard<std::mutex> lock2(clients_mtx);
         for (socket_t s : it->second) {
             for (auto& c : clients) {
@@ -635,33 +631,41 @@ void process_admin_command(const std::string& line) {
             }
         }
     }
-    else if (cmd == "/delete_room") {
+        else if (cmd == "/delete_room") {
         std::string room;
         if (!(iss >> room)) {
             std::cout << "Использование: /delete_room #комната\n";
             return;
         }
-        // Удаляем комнату: выгоняем всех в глобальный чат
+
+        // Собираем сокеты участников и очищаем current_room под корректным порядком блокировок
+        std::set<socket_t> affected;
         {
-            std::lock_guard<std::mutex> lock(rooms_mtx);
-            auto it = rooms.find(room);
-            if (it == rooms.end()) {
-                std::cout << "Комната не найдена.\n";
-                return;
+            std::lock_guard<std::mutex> lock(clients_mtx);   // сначала clients_mtx
+            {
+                std::lock_guard<std::mutex> lock2(rooms_mtx);
+                auto it = rooms.find(room);
+                if (it == rooms.end()) {
+                    std::cout << "Комната не найдена.\n";
+                    return;
+                }
+                affected = it->second;                       // копируем сокеты
+                rooms.erase(it);                             // удаляем комнату
             }
-            // Для каждого сокета очищаем current_room
-            std::lock_guard<std::mutex> lock2(clients_mtx);
-            for (socket_t s : it->second) {
-                for (auto& c : clients) {
-                    if (c.socket == s) {
-                        c.current_room.clear();
-                        break;
-                    }
+
+            // Очищаем current_room у всех бывших участников
+            for (auto& c : clients) {
+                if (affected.count(c.socket)) {
+                    c.current_room.clear();
                 }
             }
-            rooms.erase(it);
         }
-        broadcast_to_room(room, SYS_COL + "Система: Комната " + room + " удалена администратором." + RESET);
+
+        // Рассылаем уведомления вне блокировок
+        for (socket_t s : affected) {
+            send_line(s, SYS_COL + "Система: Комната " + room + " удалена администратором. Вы возвращены в общий чат." + RESET);
+        }
+
         std::cout << "Комната " << room << " удалена.\n";
     }
     else if (cmd == "/kick") {
@@ -817,14 +821,13 @@ void process_admin_command(const std::string& line) {
             }
             clients.clear();
         }
-        // Очищать комнаты не обязательно, сервер завершается
     }
     else {
         std::cout << "Неизвестная команда. Введите /help для списка.\n";
     }
 }
 
-// Поток приёма подключений (без изменений, кроме фиксации освобождения сокета)
+// Поток приёма подключений
 void accept_loop(int port) {
     listen_sock_global = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_sock_global == INVALID_SOCK) {
@@ -879,7 +882,7 @@ void accept_loop(int port) {
     }
 }
 
-// Клиент (без изменений)
+// Клиент
 void run_client(const std::string& ip, int port) {
     std::string nick;
     std::cout << "Введите ваш ник: ";
@@ -974,7 +977,7 @@ void run_client(const std::string& ip, int port) {
     std::cout << "Чат завершён." << std::endl;
 }
 
-// main (без изменений)
+// main
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Использование:\n"
