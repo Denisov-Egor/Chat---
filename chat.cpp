@@ -5,7 +5,6 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
-#include <cstring>
 #include <set>
 #include <map>
 #include <deque>
@@ -61,6 +60,8 @@ std::mutex clients_mtx;
 std::mutex banned_mtx;
 std::mutex rooms_mtx;
 
+const size_t MAX_NICK_LENGTH = 32;  // максимальная длина ника
+
 struct ClientInfo {
     socket_t socket;
     std::string nickname;
@@ -68,6 +69,7 @@ struct ClientInfo {
     bool muted = false;
     std::deque<std::chrono::steady_clock::time_point> msg_times;
     std::string current_room;
+    std::set<std::string> ignored_nicks;
 
     ClientInfo(socket_t s, const std::string& n, const std::string& i)
         : socket(s), nickname(n), ip(i) {}
@@ -87,11 +89,16 @@ std::mutex admin_cout_mtx;
 std::ofstream log_file;
 bool logging_to_file = false;
 
-// Функция логирования событий
+// Потокобезопасная функция логирования
 void log_event(const std::string& msg) {
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm = *std::localtime(&t);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
     char time_buf[32];
     std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm);
     std::string full_msg = std::string(time_buf) + " " + msg;
@@ -258,8 +265,10 @@ void process_command(const std::string& line, socket_t sock) {
             "  /join #комната - войти в комнату\n"
             "  /create #комната - создать комнату и войти\n"
             "  /leave         - выйти из комнаты (вернуться в общий чат)\n"
-            "  /whisper <ник> <текст> - личное сообщение\n"
+            "  /msg <ник> <текст> - личное сообщение\n"
             "  /nick <новый>  - сменить ник\n"
+            "  /ignore <ник>  - игнорировать сообщения от пользователя\n"
+            "  /unignore <ник> - перестать игнорировать\n"
             "  /quit          - выйти из чата\n";
         send_line(sock, SYS_COL + help + RESET);
     }
@@ -346,10 +355,10 @@ void process_command(const std::string& line, socket_t sock) {
         leave_current_room(sock, my_nick, old_room);
         send_line(sock, SYS_COL + "Вы вышли из комнаты " + old_room + RESET);
     }
-    else if (cmd == "/whisper") {
+    else if (cmd == "/msg") {
         std::string target, text;
         if (!(iss >> target)) {
-            send_line(sock, ERR_COL + "Использование: /whisper <ник> <текст>" + RESET);
+            send_line(sock, ERR_COL + "Использование: /msg <ник> <текст>" + RESET);
             return;
         }
         std::getline(iss, text);
@@ -377,8 +386,10 @@ void process_command(const std::string& line, socket_t sock) {
             send_line(sock, ERR_COL + "Использование: /nick <новый ник>" + RESET);
             return;
         }
-        if (new_nick.empty() || new_nick.find_first_of(" /\r\n") != std::string::npos) {
-            send_line(sock, ERR_COL + "Ник не должен содержать пробелы или запрещённые символы" + RESET);
+        if (new_nick.empty() || new_nick.length() > MAX_NICK_LENGTH ||
+            new_nick.find_first_of(" /\r\n") != std::string::npos) {
+            send_line(sock, ERR_COL + "Ник должен быть от 1 до " + std::to_string(MAX_NICK_LENGTH) +
+                      " символов и не содержать пробелов или запрещённых символов" + RESET);
             return;
         }
         if (new_nick == "Система") {
@@ -416,11 +427,85 @@ void process_command(const std::string& line, socket_t sock) {
             return;
         }
 
+        // Обновляем старый ник в игнор-листах других пользователей
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            for (auto& c : clients) {
+                if (c.socket != sock) {
+                    auto it = c.ignored_nicks.find(old_nick);
+                    if (it != c.ignored_nicks.end()) {
+                        c.ignored_nicks.erase(it);
+                        c.ignored_nicks.insert(new_nick);
+                    }
+                }
+            }
+        }
+
         broadcast_global(SYS_COL + "Система: " + old_nick + " теперь известен как " + new_nick + RESET);
         if (!my_room.empty()) {
             broadcast_to_room(my_room, SYS_COL + "Система: " + old_nick + " теперь известен как " + new_nick + RESET);
         }
         log_event(old_nick + " сменил ник на " + new_nick);
+    }
+    else if (cmd == "/ignore") {
+        std::string target;
+        if (!(iss >> target)) {
+            send_line(sock, ERR_COL + "Использование: /ignore <ник>" + RESET);
+            return;
+        }
+        if (target == my_nick) {
+            send_line(sock, ERR_COL + "Нельзя игнорировать самого себя" + RESET);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            bool target_exists = false;
+            for (auto& c : clients) {
+                if (c.nickname == target) {
+                    target_exists = true;
+                    break;
+                }
+            }
+            if (!target_exists) {
+                send_line(sock, ERR_COL + "Пользователь '" + target + "' не найден" + RESET);
+                return;
+            }
+
+            for (auto& c : clients) {
+                if (c.socket == sock) {
+                    if (c.ignored_nicks.insert(target).second) {
+                        send_line(sock, SYS_COL + "Вы теперь игнорируете пользователя " + target + RESET);
+                        log_event(my_nick + " начал игнорировать " + target);
+                    } else {
+                        send_line(sock, ERR_COL + "Пользователь " + target + " уже в вашем списке игнорируемых" + RESET);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    else if (cmd == "/unignore") {
+        std::string target;
+        if (!(iss >> target)) {
+            send_line(sock, ERR_COL + "Использование: /unignore <ник>" + RESET);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            for (auto& c : clients) {
+                if (c.socket == sock) {
+                    if (c.ignored_nicks.erase(target) > 0) {
+                        send_line(sock, SYS_COL + "Вы больше не игнорируете пользователя " + target + RESET);
+                        log_event(my_nick + " перестал игнорировать " + target);
+                    } else {
+                        send_line(sock, ERR_COL + "Пользователь " + target + " не был в вашем списке игнорируемых" + RESET);
+                    }
+                    break;
+                }
+            }
+        }
     }
     else {
         send_line(sock, ERR_COL + "Неизвестная команда. Введите /help для списка" + RESET);
@@ -455,8 +540,10 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
             buffer.erase(0, pos + 1);
             nick.erase(std::remove(nick.begin(), nick.end(), '\r'), nick.end());
             nick.erase(std::remove(nick.begin(), nick.end(), ' '), nick.end());
-            if (nick.empty() || nick == "Система" || nick.find_first_of("/\r\n") != std::string::npos) {
-                send_line(sock, ERR_COL + "Недопустимый ник." + RESET);
+            if (nick.empty() || nick.length() > MAX_NICK_LENGTH ||
+                nick == "Система" || nick.find_first_of("/\r\n") != std::string::npos) {
+                send_line(sock, ERR_COL + "Недопустимый ник. Используйте от 1 до " +
+                          std::to_string(MAX_NICK_LENGTH) + " символов без пробелов и /." + RESET);
                 CLOSE_SOCKET(sock);
                 return;
             }
@@ -538,7 +625,6 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
             if (!exists) return;
 
             if (line == "/quit") {
-                broadcast_global(SYS_COL + "Система: " + nick + " покинул чат." + RESET);
                 remove_client(sock, nick);
                 return;
             }
@@ -582,11 +668,35 @@ void handle_client(socket_t sock, sockaddr_in client_addr) {
                 std::lock_guard<std::mutex> lock(clients_mtx);
                 for (auto& c : clients) {
                     if (c.current_room.empty() && c.socket != sock) {
-                        send_line(c.socket, full_msg);
+                        if (c.ignored_nicks.count(nick) == 0) {
+                            send_line(c.socket, full_msg);
+                        }
                     }
                 }
             } else {
-                broadcast_to_room(room, full_msg, sock);
+                std::set<socket_t> target_sockets;
+                {
+                    std::lock_guard<std::mutex> lock_rooms(rooms_mtx);
+                    auto it = rooms.find(room);
+                    if (it != rooms.end()) {
+                        target_sockets = it->second;
+                    }
+                }
+                if (!target_sockets.empty()) {
+                    std::lock_guard<std::mutex> lock_clients(clients_mtx);
+                    for (socket_t s : target_sockets) {
+                        if (s != sock) {
+                            for (auto& c : clients) {
+                                if (c.socket == s) {
+                                    if (c.ignored_nicks.count(nick) == 0) {
+                                        send_line(s, full_msg);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             log_event(log_text);
@@ -603,7 +713,7 @@ void process_admin_command(const std::string& line) {
         std::cout << "Команды администратора:\n"
                   << "  /list              - список участников\n"
                   << "  /rooms             - список комнат\n"
-                  << "  /room_members #room- участники комнаты\n"
+                  << "  /room_members #room - участники комнаты\n"
                   << "  /delete_room #room - удалить комнату\n"
                   << "  /kick <ник>        - выгнать участника из чата\n"
                   << "  /ban <ник>         - забанить по IP\n"
@@ -634,19 +744,27 @@ void process_admin_command(const std::string& line) {
             std::cout << "Использование: /room_members #комната\n";
             return;
         }
-        std::lock_guard<std::mutex> lock(rooms_mtx);
-        auto it = rooms.find(room);
-        if (it == rooms.end()) {
-            std::cout << "Комната не найдена.\n";
-            return;
+
+        std::set<socket_t> member_sockets;
+        {
+            std::lock_guard<std::mutex> lock(rooms_mtx);
+            auto it = rooms.find(room);
+            if (it == rooms.end()) {
+                std::cout << "Комната не найдена.\n";
+                return;
+            }
+            member_sockets = it->second;
         }
+
         std::cout << "Участники комнаты " << room << ":\n";
-        std::lock_guard<std::mutex> lock2(clients_mtx);
-        for (socket_t s : it->second) {
-            for (auto& c : clients) {
-                if (c.socket == s) {
-                    std::cout << "  " << c.nickname << "\n";
-                    break;
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
+            for (socket_t s : member_sockets) {
+                for (auto& c : clients) {
+                    if (c.socket == s) {
+                        std::cout << "  " << c.nickname << "\n";
+                        break;
+                    }
                 }
             }
         }
@@ -660,18 +778,18 @@ void process_admin_command(const std::string& line) {
 
         std::set<socket_t> affected;
         {
-            std::lock_guard<std::mutex> lock(clients_mtx);
-            {
-                std::lock_guard<std::mutex> lock2(rooms_mtx);
-                auto it = rooms.find(room);
-                if (it == rooms.end()) {
-                    std::cout << "Комната не найдена.\n";
-                    return;
-                }
-                affected = it->second;
-                rooms.erase(it);
+            std::lock_guard<std::mutex> lock(rooms_mtx);
+            auto it = rooms.find(room);
+            if (it == rooms.end()) {
+                std::cout << "Комната не найдена.\n";
+                return;
             }
+            affected = it->second;
+            rooms.erase(it);
+        }
 
+        {
+            std::lock_guard<std::mutex> lock(clients_mtx);
             for (auto& c : clients) {
                 if (affected.count(c.socket)) {
                     c.current_room.clear();
@@ -907,10 +1025,11 @@ void accept_loop(int port) {
 
 void run_client(const std::string& ip, int port) {
     std::string nick;
-    std::cout << "Введите ваш ник: ";
+    std::cout << "Введите ваш ник (1-" << MAX_NICK_LENGTH << " символов, без пробелов и /): ";
     std::getline(std::cin, nick);
-    while (nick.empty() || nick.find_first_of(" /\r\n") != std::string::npos || nick == "Система") {
-        std::cout << "Ник не может быть пустым, содержать пробелы или '/'. Введите ещё раз: ";
+    while (nick.empty() || nick.length() > MAX_NICK_LENGTH ||
+           nick.find_first_of(" /\r\n") != std::string::npos || nick == "Система") {
+        std::cout << "Недопустимый ник. Введите снова (1-" << MAX_NICK_LENGTH << " символов): ";
         std::getline(std::cin, nick);
     }
 
